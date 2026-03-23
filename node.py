@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 import uuid
 import time
+import datetime
 import requests
 import os
 
@@ -49,7 +50,7 @@ def send_message(msg: Message):
         "sender": msg.sender,
         "receiver": msg.receiver,
         "content": msg.content,
-        "timestamp": time.time()
+        "timestamp": datetime.datetime.now().astimezone().isoformat()
     }
 
     messages.append(message)
