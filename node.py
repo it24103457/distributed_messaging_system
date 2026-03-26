@@ -22,6 +22,7 @@ PEERS = [
 # -------- STORAGE --------
 
 messages = []
+lamport_clock = 0
 
 # -------- MESSAGE MODEL --------
 
@@ -38,19 +39,23 @@ def status():
     return {
         "node": NODE_ID,
         "port": PORT,
+        "clock": lamport_clock,
         "messages_stored": len(messages)
     }
 
 
 @app.post("/send")
 def send_message(msg: Message):
+    global lamport_clock
+    lamport_clock += 1
 
     message = {
         "id": str(uuid.uuid4()),
         "sender": msg.sender,
         "receiver": msg.receiver,
         "content": msg.content,
-        "timestamp": datetime.datetime.now().astimezone().isoformat()
+        "timestamp": datetime.datetime.now().astimezone().isoformat(),
+        "clock": lamport_clock
     }
 
     messages.append(message)
@@ -68,6 +73,10 @@ def send_message(msg: Message):
 
 @app.post("/replicate")
 def replicate_message(message: dict):
+    global lamport_clock
+    # update local clock based on incoming message clock
+    lamport_clock = max(lamport_clock, message.get("clock", 0)) + 1
+    
     # avoid duplicates
     if not any(m["id"] == message["id"] for m in messages):
         messages.append(message)
@@ -77,7 +86,9 @@ def replicate_message(message: dict):
 
 @app.get("/messages")
 def get_messages():
+    # Sort primarily by Lamport clock, tie-break by message ID for deterministic total ordering
+    sorted_messages = sorted(messages, key=lambda m: (m.get("clock", 0), m.get("id", "")))
     return {
         "node": NODE_ID,
-        "messages": messages
+        "messages": sorted_messages
     }
