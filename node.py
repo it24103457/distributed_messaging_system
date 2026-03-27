@@ -46,6 +46,10 @@ class Message(BaseModel):
     receiver: str
     content: str
 
+class EditMessage(BaseModel):
+    id: str
+    content: str
+
 
 # -------- ENDPOINTS --------
 
@@ -57,7 +61,6 @@ def status():
         "clock": lamport_clock,
         "messages_stored": len(messages)
     }
-
 
 @app.post("/send")
 def send_message(msg: Message):
@@ -86,6 +89,32 @@ def send_message(msg: Message):
 
     return {"stored_at": NODE_ID, "message": message}
 
+@app.put("/edit")
+def edit_message(edit_msg: EditMessage):
+    global lamport_clock
+    lamport_clock += 1
+    
+    for i, m in enumerate(messages):
+        if m["id"] == edit_msg.id:
+            # Create an updated copy
+            updated_m = m.copy()
+            updated_m["content"] = edit_msg.content
+            updated_m["clock"] = lamport_clock
+            updated_m["timestamp"] = datetime.datetime.now().astimezone().isoformat()
+            
+            messages[i] = updated_m
+            append_to_wal(updated_m)
+            
+            # Broadcast update
+            for peer in PEERS:
+                if f":{PORT}" not in peer:
+                    try:
+                        requests.post(peer + "/replicate", json=updated_m, timeout=1)
+                    except:
+                        pass
+            return {"edited_at": NODE_ID, "message": updated_m}
+            
+    return {"error": "Message not found"}
 
 @app.post("/replicate")
 def replicate_message(message: dict):
@@ -93,12 +122,24 @@ def replicate_message(message: dict):
     # update local clock based on incoming message clock
     lamport_clock = max(lamport_clock, message.get("clock", 0)) + 1
     
-    # avoid duplicates
-    if not any(m["id"] == message["id"] for m in messages):
-        append_to_wal(message)
-        messages.append(message)
+    # Conflict Resolution: Last-Write-Wins (LWW) (Eventual Consistency)
+    for i, m in enumerate(messages):
+        if m["id"] == message["id"]:
+            # If incoming message has a strictly higher logical clock, overwrite ours
+            if message.get("clock", 0) > m.get("clock", 0):
+                messages[i] = message
+                append_to_wal(message)
+            # If timestamps match exactly (tie), break tie using sender
+            elif message.get("clock", 0) == m.get("clock", 0) and message.get("sender", "") > m.get("sender", ""):
+                messages[i] = message
+                append_to_wal(message)
+            return {"replicated_at": NODE_ID, "status": "conflict_resolved"}
 
-    return {"replicated_at": NODE_ID}
+    # If message is completely new, append it
+    append_to_wal(message)
+    messages.append(message)
+
+    return {"replicated_at": NODE_ID, "status": "added"}
 
 
 @app.get("/messages")
