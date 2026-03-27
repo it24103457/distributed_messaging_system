@@ -6,6 +6,7 @@ import datetime
 import requests
 import os
 import json
+import threading
 
 app = FastAPI()
 
@@ -39,6 +40,30 @@ if os.path.exists(WAL_FILE):
                 messages.append(msg)
                 lamport_clock = max(lamport_clock, msg.get("clock", 0))
 
+# -------- STATE & HEARTBEATS --------
+
+active_peers = set()
+
+def heartbeat_task():
+    while True:
+        current_active = set()
+        for peer in PEERS:
+            if f":{PORT}" not in peer:
+                try:
+                    response = requests.get(peer + "/ping", timeout=1)
+                    if response.status_code == 200:
+                        current_active.add(peer)
+                except requests.exceptions.RequestException:
+                    pass
+        
+        active_peers.clear()
+        active_peers.update(current_active)
+        time.sleep(5)
+
+@app.on_event("startup")
+def startup_event():
+    threading.Thread(target=heartbeat_task, daemon=True).start()
+
 # -------- MESSAGE MODEL --------
 
 class Message(BaseModel):
@@ -59,8 +84,14 @@ def status():
         "node": NODE_ID,
         "port": PORT,
         "clock": lamport_clock,
-        "messages_stored": len(messages)
+        "messages_stored": len(messages),
+        "active_peers": list(active_peers)
     }
+
+@app.get("/ping")
+def ping():
+    return {"status": "alive", "node": NODE_ID}
+
 
 @app.post("/send")
 def send_message(msg: Message):
