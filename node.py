@@ -5,6 +5,7 @@ import time
 import datetime
 import requests
 import os
+import json
 
 app = FastAPI()
 
@@ -23,6 +24,20 @@ PEERS = [
 
 messages = []
 lamport_clock = 0
+WAL_FILE = f"wal_{PORT}.jsonl"
+
+def append_to_wal(message):
+    with open(WAL_FILE, "a") as f:
+        f.write(json.dumps(message) + "\n")
+
+# Load existing WAL on startup
+if os.path.exists(WAL_FILE):
+    with open(WAL_FILE, "r") as f:
+        for line in f:
+            if line.strip():
+                msg = json.loads(line)
+                messages.append(msg)
+                lamport_clock = max(lamport_clock, msg.get("clock", 0))
 
 # -------- MESSAGE MODEL --------
 
@@ -58,6 +73,7 @@ def send_message(msg: Message):
         "clock": lamport_clock
     }
 
+    append_to_wal(message)
     messages.append(message)
 
     # replicate to peers
@@ -79,6 +95,7 @@ def replicate_message(message: dict):
     
     # avoid duplicates
     if not any(m["id"] == message["id"] for m in messages):
+        append_to_wal(message)
         messages.append(message)
 
     return {"replicated_at": NODE_ID}
