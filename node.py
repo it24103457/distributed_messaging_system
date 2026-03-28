@@ -1,4 +1,4 @@
-from fastapi import FastAPI, BackgroundTasks
+from fastapi import FastAPI
 from pydantic import BaseModel
 import uuid
 import time
@@ -14,13 +14,16 @@ app = FastAPI()
 
 NODE_ID = os.getenv("NODE_ID", "Node")
 PORT = int(os.getenv("PORT", 5001))
-FALLBACK_TIMEOUT = int(os.getenv("FALLBACK_TIMEOUT", 10))
 
 PEERS = [
     "http://localhost:5001",
     "http://localhost:5002",
     "http://localhost:5003"
 ]
+
+# 🔥 FIXED: TOTAL CLUSTER SIZE
+TOTAL_NODES = len(PEERS)
+QUORUM = (TOTAL_NODES // 2) + 1
 
 # -------- STORAGE --------
 
@@ -32,7 +35,7 @@ def append_to_wal(message):
     with open(WAL_FILE, "a") as f:
         f.write(json.dumps(message) + "\n")
 
-# Load existing WAL on startup
+# Load WAL
 if os.path.exists(WAL_FILE):
     with open(WAL_FILE, "r") as f:
         for line in f:
@@ -41,39 +44,42 @@ if os.path.exists(WAL_FILE):
                 messages.append(msg)
                 lamport_clock = max(lamport_clock, msg.get("clock", 0))
 
-# -------- STATE & LEADER ELECTION --------
+# -------- STATE --------
 
 active_peers = set()
 current_leader = f"http://localhost:{PORT}"
 
+# -------- HEARTBEAT --------
+
 def heartbeat_task():
     global current_leader
+
     while True:
         current_active = set()
+
         for peer in PEERS:
             if f":{PORT}" not in peer:
                 try:
-                    response = requests.get(peer + "/ping", timeout=1)
-                    if response.status_code == 200:
+                    res = requests.get(peer + "/ping", timeout=3)
+                    if res.status_code == 200:
                         current_active.add(peer)
-                except requests.exceptions.RequestException:
+                except:
                     pass
-        
-        # Leader Election: Highest ID (URL string) wins
-        # Atomically update active_peers to avoid empty lists during reads
-        global active_peers
-        active_peers = current_active
-        
+
+        active_peers.clear()
+        active_peers.update(current_active)
+
+        # Leader election (highest URL wins)
         all_alive = list(active_peers) + [f"http://localhost:{PORT}"]
         current_leader = max(all_alive)
-        
+
         time.sleep(5)
 
 @app.on_event("startup")
-def startup_event():
+def startup():
     threading.Thread(target=heartbeat_task, daemon=True).start()
 
-# -------- MESSAGE MODEL --------
+# -------- MODELS --------
 
 class Message(BaseModel):
     sender: str
@@ -84,6 +90,57 @@ class EditMessage(BaseModel):
     id: str
     content: str
 
+# -------- UTILS --------
+
+# 🔥 FIXED: Quorum based on TOTAL nodes
+def quorum_write(message):
+    success = 1  # self always counts
+
+    for peer in PEERS:
+        if f":{PORT}" in peer:
+            continue
+
+        try:
+            res = requests.post(peer + "/replicate", json=message, timeout=1)
+            if res.status_code == 200:
+                success += 1
+        except:
+            pass
+
+    return success >= QUORUM
+
+
+# 🔥 FIXED: Quorum read based on TOTAL nodes
+def quorum_read():
+    responses = []
+
+    # include self
+    responses.append(messages)
+
+    for peer in PEERS:
+        if f":{PORT}" in peer:
+            continue
+
+        try:
+            res = requests.get(peer + "/messages_local", timeout=1)
+            if res.status_code == 200:
+                responses.append(res.json().get("messages", []))
+        except:
+            pass
+
+    if len(responses) < QUORUM:
+        return None
+
+    # merge with LWW
+    merged = {}
+
+    for node_msgs in responses:
+        for m in node_msgs:
+            existing = merged.get(m["id"])
+            if not existing or m["clock"] > existing["clock"]:
+                merged[m["id"]] = m
+
+    return list(merged.values())
 
 # -------- ENDPOINTS --------
 
@@ -93,32 +150,30 @@ def status():
         "node": NODE_ID,
         "port": PORT,
         "clock": lamport_clock,
-        "messages_stored": len(messages),
+        "messages": len(messages),
         "active_peers": list(active_peers),
-        "leader": current_leader
+        "leader": current_leader,
+        "quorum_required": QUORUM
     }
 
 @app.get("/ping")
-async def ping():
-    return {"status": "alive", "node": NODE_ID}
+def ping():
+    return {"status": "alive"}
 
+@app.get("/messages_local")
+def local_messages():
+    return {"messages": messages}
 
-def replicate_to_peers(message):
-    for peer in PEERS:
-        if f":{PORT}" not in peer:
-            try:
-                requests.post(peer + "/replicate", json=message, timeout=1)
-            except:
-                pass
+# -------- SEND --------
 
 @app.post("/send")
-def send_message(msg: Message, background_tasks: BackgroundTasks):
-    # Leader-only Writes (Write Forwarding)
-    if current_leader and current_leader != f"http://localhost:{PORT}":
+def send(msg: Message):
+
+    # Forward to leader
+    if current_leader != f"http://localhost:{PORT}":
         try:
-            response = requests.post(current_leader + "/send", json=msg.dict(), timeout=FALLBACK_TIMEOUT)
-            return response.json()
-        except requests.exceptions.RequestException:
+            return requests.post(current_leader + "/send", json=msg.dict(), timeout=10).json()
+        except:
             return {"error": "Leader unavailable"}
 
     global lamport_clock
@@ -133,71 +188,90 @@ def send_message(msg: Message, background_tasks: BackgroundTasks):
         "clock": lamport_clock
     }
 
+    # 🔥 QUORUM FIRST
+    if not quorum_write(message):
+        return {
+            "error": "Quorum not achieved",
+            "required": QUORUM,
+            "hint": "At least 2 nodes must be alive"
+        }
+
+    # Commit only after quorum
     append_to_wal(message)
     messages.append(message)
 
-    # replicate to peers
-    background_tasks.add_task(replicate_to_peers, message)
-
     return {"stored_at": NODE_ID, "message": message}
 
+# -------- EDIT --------
+
 @app.put("/edit")
-def edit_message(edit_msg: EditMessage, background_tasks: BackgroundTasks):
-    # Leader-only Writes (Write Forwarding)
-    if current_leader and current_leader != f"http://localhost:{PORT}":
+def edit(edit_msg: EditMessage):
+
+    if current_leader != f"http://localhost:{PORT}":
         try:
-            response = requests.put(current_leader + "/edit", json=edit_msg.dict(), timeout=FALLBACK_TIMEOUT)
-            return response.json()
-        except requests.exceptions.RequestException:
+            return requests.put(current_leader + "/edit", json=edit_msg.dict(), timeout=10).json()
+        except:
             return {"error": "Leader unavailable"}
 
     global lamport_clock
     lamport_clock += 1
-    
+
     for i, m in enumerate(messages):
         if m["id"] == edit_msg.id:
-            updated_m = m.copy()
-            updated_m["content"] = edit_msg.content
-            updated_m["clock"] = lamport_clock
-            updated_m["timestamp"] = datetime.datetime.now().astimezone().isoformat()
-            
-            messages[i] = updated_m
-            append_to_wal(updated_m)
-            
-            # Broadcast update
-            background_tasks.add_task(replicate_to_peers, updated_m)
-            return {"edited_at": NODE_ID, "message": updated_m}
-            
+
+            updated = m.copy()
+            updated["content"] = edit_msg.content
+            updated["clock"] = lamport_clock
+            updated["timestamp"] = datetime.datetime.now().astimezone().isoformat()
+
+            # 🔥 QUORUM FIRST
+            if not quorum_write(updated):
+                return {"error": "Quorum not achieved"}
+
+            messages[i] = updated
+            append_to_wal(updated)
+
+            return {"edited_at": NODE_ID, "message": updated}
+
     return {"error": "Message not found"}
 
+# -------- REPLICATION --------
+
 @app.post("/replicate")
-def replicate_message(message: dict):
+def replicate(message: dict):
     global lamport_clock
-    # update local clock based on incoming message clock
+
     lamport_clock = max(lamport_clock, message.get("clock", 0)) + 1
-    
-    # Conflict Resolution: Last-Write-Wins (LWW) (Eventual Consistency)
+
+    # Deduplication + LWW
     for i, m in enumerate(messages):
         if m["id"] == message["id"]:
-            if message.get("clock", 0) > m.get("clock", 0):
+            if message["clock"] > m["clock"]:
                 messages[i] = message
                 append_to_wal(message)
-            elif message.get("clock", 0) == m.get("clock", 0) and message.get("sender", "") > m.get("sender", ""):
-                messages[i] = message
-                append_to_wal(message)
-            return {"replicated_at": NODE_ID, "status": "conflict_resolved"}
+            return {"status": "updated"}
 
-    append_to_wal(message)
     messages.append(message)
+    append_to_wal(message)
 
-    return {"replicated_at": NODE_ID, "status": "added"}
+    return {"status": "added"}
 
+# -------- READ --------
 
 @app.get("/messages")
 def get_messages():
-    # Sort primarily by Lamport clock, tie-break by message ID for deterministic total ordering
-    sorted_messages = sorted(messages, key=lambda m: (m.get("clock", 0), m.get("id", "")))
+
+    result = quorum_read()
+
+    if result is None:
+        return {
+            "error": "Quorum read failed",
+            "required": QUORUM
+        }
+
+    sorted_msgs = sorted(result, key=lambda m: (m["clock"], m["id"]))
+
     return {
         "node": NODE_ID,
-        "messages": sorted_messages
+        "messages": sorted_msgs
     }
