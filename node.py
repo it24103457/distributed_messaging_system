@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, BackgroundTasks
 from pydantic import BaseModel
 import uuid
 import time
@@ -14,6 +14,7 @@ app = FastAPI()
 
 NODE_ID = os.getenv("NODE_ID", "Node")
 PORT = int(os.getenv("PORT", 5001))
+FALLBACK_TIMEOUT = int(os.getenv("FALLBACK_TIMEOUT", 10))
 
 PEERS = [
     "http://localhost:5001",
@@ -40,11 +41,13 @@ if os.path.exists(WAL_FILE):
                 messages.append(msg)
                 lamport_clock = max(lamport_clock, msg.get("clock", 0))
 
-# -------- STATE & HEARTBEATS --------
+# -------- STATE & LEADER ELECTION --------
 
 active_peers = set()
+current_leader = f"http://localhost:{PORT}"
 
 def heartbeat_task():
+    global current_leader
     while True:
         current_active = set()
         for peer in PEERS:
@@ -56,8 +59,14 @@ def heartbeat_task():
                 except requests.exceptions.RequestException:
                     pass
         
-        active_peers.clear()
-        active_peers.update(current_active)
+        # Leader Election: Highest ID (URL string) wins
+        # Atomically update active_peers to avoid empty lists during reads
+        global active_peers
+        active_peers = current_active
+        
+        all_alive = list(active_peers) + [f"http://localhost:{PORT}"]
+        current_leader = max(all_alive)
+        
         time.sleep(5)
 
 @app.on_event("startup")
@@ -85,16 +94,33 @@ def status():
         "port": PORT,
         "clock": lamport_clock,
         "messages_stored": len(messages),
-        "active_peers": list(active_peers)
+        "active_peers": list(active_peers),
+        "leader": current_leader
     }
 
 @app.get("/ping")
-def ping():
+async def ping():
     return {"status": "alive", "node": NODE_ID}
 
 
+def replicate_to_peers(message):
+    for peer in PEERS:
+        if f":{PORT}" not in peer:
+            try:
+                requests.post(peer + "/replicate", json=message, timeout=1)
+            except:
+                pass
+
 @app.post("/send")
-def send_message(msg: Message):
+def send_message(msg: Message, background_tasks: BackgroundTasks):
+    # Leader-only Writes (Write Forwarding)
+    if current_leader and current_leader != f"http://localhost:{PORT}":
+        try:
+            response = requests.post(current_leader + "/send", json=msg.dict(), timeout=FALLBACK_TIMEOUT)
+            return response.json()
+        except requests.exceptions.RequestException:
+            return {"error": "Leader unavailable"}
+
     global lamport_clock
     lamport_clock += 1
 
@@ -111,23 +137,25 @@ def send_message(msg: Message):
     messages.append(message)
 
     # replicate to peers
-    for peer in PEERS:
-        if f":{PORT}" not in peer:
-            try:
-                requests.post(peer + "/replicate", json=message, timeout=1)
-            except:
-                pass
+    background_tasks.add_task(replicate_to_peers, message)
 
     return {"stored_at": NODE_ID, "message": message}
 
 @app.put("/edit")
-def edit_message(edit_msg: EditMessage):
+def edit_message(edit_msg: EditMessage, background_tasks: BackgroundTasks):
+    # Leader-only Writes (Write Forwarding)
+    if current_leader and current_leader != f"http://localhost:{PORT}":
+        try:
+            response = requests.put(current_leader + "/edit", json=edit_msg.dict(), timeout=FALLBACK_TIMEOUT)
+            return response.json()
+        except requests.exceptions.RequestException:
+            return {"error": "Leader unavailable"}
+
     global lamport_clock
     lamport_clock += 1
     
     for i, m in enumerate(messages):
         if m["id"] == edit_msg.id:
-            # Create an updated copy
             updated_m = m.copy()
             updated_m["content"] = edit_msg.content
             updated_m["clock"] = lamport_clock
@@ -137,12 +165,7 @@ def edit_message(edit_msg: EditMessage):
             append_to_wal(updated_m)
             
             # Broadcast update
-            for peer in PEERS:
-                if f":{PORT}" not in peer:
-                    try:
-                        requests.post(peer + "/replicate", json=updated_m, timeout=1)
-                    except:
-                        pass
+            background_tasks.add_task(replicate_to_peers, updated_m)
             return {"edited_at": NODE_ID, "message": updated_m}
             
     return {"error": "Message not found"}
@@ -156,17 +179,14 @@ def replicate_message(message: dict):
     # Conflict Resolution: Last-Write-Wins (LWW) (Eventual Consistency)
     for i, m in enumerate(messages):
         if m["id"] == message["id"]:
-            # If incoming message has a strictly higher logical clock, overwrite ours
             if message.get("clock", 0) > m.get("clock", 0):
                 messages[i] = message
                 append_to_wal(message)
-            # If timestamps match exactly (tie), break tie using sender
             elif message.get("clock", 0) == m.get("clock", 0) and message.get("sender", "") > m.get("sender", ""):
                 messages[i] = message
                 append_to_wal(message)
             return {"replicated_at": NODE_ID, "status": "conflict_resolved"}
 
-    # If message is completely new, append it
     append_to_wal(message)
     messages.append(message)
 
