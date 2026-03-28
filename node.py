@@ -1,4 +1,5 @@
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uuid
 import time
@@ -7,9 +8,17 @@ import requests
 import os
 import json
 import threading
+import random
 
 app = FastAPI()
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 # -------- CONFIG --------
 
 NODE_ID = os.getenv("NODE_ID", "Node")
@@ -20,7 +29,9 @@ SELF_URL = f"http://localhost:{PORT}"
 PEERS = [
     "http://localhost:5001",
     "http://localhost:5002",
-    "http://localhost:5003"
+    "http://localhost:5003",
+    "http://localhost:5004",
+    "http://localhost:5005"
 ]
 
 TOTAL_NODES = len(PEERS)
@@ -47,55 +58,107 @@ if os.path.exists(WAL_FILE):
 # -------- STATE --------
 
 active_peers = set()
-current_leader = SELF_URL
+current_leader = None
 
-# -------- HEARTBEAT --------
+node_state = "FOLLOWER"
+current_term = 0
+voted_for = None
+last_heartbeat = time.time()
 
-def heartbeat_task():
-    global current_leader
+# -------- LEADER ELECTION (RAFT) --------
 
+def reset_election_timeout():
+    global last_heartbeat
+    last_heartbeat = time.time()
+
+def get_election_timeout():
+    return random.uniform(3.0, 6.0)
+
+def election_timer_task():
+    global node_state, current_term, voted_for, current_leader
+    
+    timeout = get_election_timeout()
+    
     while True:
-        alive = []
+        time.sleep(0.5)
+        
+        if node_state == "LEADER":
+            continue
+            
+        if time.time() - last_heartbeat > timeout:
+            print(f"[{NODE_ID}] Election timeout! Starting election for term {current_term + 1}")
+            node_state = "CANDIDATE"
+            current_term += 1
+            voted_for = SELF_URL
+            votes_received = 1
+            reset_election_timeout()
+            timeout = get_election_timeout()
+            
+            for peer in PEERS:
+                if peer == SELF_URL:
+                    continue
+                try:
+                    res = requests.post(peer + "/request_vote", json={
+                        "term": current_term,
+                        "candidate_id": SELF_URL
+                    }, timeout=1)
+                    if res.status_code == 200:
+                        data = res.json()
+                        if data.get("term", 0) > current_term:
+                            current_term = data.get("term")
+                            node_state = "FOLLOWER"
+                            voted_for = None
+                            break
+                        if data.get("vote_granted"):
+                            votes_received += 1
+                except:
+                    pass
+            
+            if node_state == "CANDIDATE" and votes_received >= QUORUM:
+                print(f"[{NODE_ID}] Won election! I am the new leader for term {current_term}")
+                node_state = "LEADER"
+                current_leader = SELF_URL
+                
+                # Immediately send heartbeats
+                send_heartbeats()
 
-        for peer in PEERS:
-            try:
-                res = requests.get(peer + "/ping", timeout=1)
-                if res.status_code == 200:
-                    alive.append(peer)
-            except:
-                pass
-
-        active_peers.clear()
-        active_peers.update([p for p in alive if p != SELF_URL])
-
-        if alive:
-            current_leader = max(alive)
-
-        time.sleep(5)
-
-# -------- LEADER ELECTION --------
-
-def elect_new_leader():
-    global current_leader
-
-    alive = [SELF_URL]
-
+def send_heartbeats():
+    global node_state, current_term, voted_for
+    
+    alive = []
+    
     for peer in PEERS:
         if peer == SELF_URL:
             continue
         try:
-            res = requests.get(peer + "/ping", timeout=1)
+            res = requests.post(peer + "/append_entries", json={
+                "term": current_term,
+                "leader_id": SELF_URL
+            }, timeout=1)
             if res.status_code == 200:
-                alive.append(peer)
+                data = res.json()
+                if data.get("term", 0) > current_term:
+                    current_term = data.get("term")
+                    node_state = "FOLLOWER"
+                    voted_for = None
+                    return alive
+                elif data.get("success"):
+                    alive.append(peer)
         except:
             pass
+            
+    return alive
 
-    if not alive:
-        current_leader = SELF_URL
-    else:
-        current_leader = max(alive)
-
-    print(f"[{NODE_ID}] New leader: {current_leader}")
+def heartbeat_task():
+    global active_peers
+    
+    while True:
+        if node_state == "LEADER":
+            alive = send_heartbeats()
+            active_peers.clear()
+            active_peers.update(alive)
+            
+        time.sleep(1)
 
 # -------- RECOVERY --------
 
@@ -142,6 +205,7 @@ def periodic_sync():
 @app.on_event("startup")
 def startup():
     threading.Thread(target=heartbeat_task, daemon=True).start()
+    threading.Thread(target=election_timer_task, daemon=True).start()
 
     time.sleep(2)
     recover_node()
@@ -158,6 +222,14 @@ class Message(BaseModel):
 class EditMessage(BaseModel):
     id: str
     content: str
+
+class RequestVote(BaseModel):
+    term: int
+    candidate_id: str
+
+class AppendEntries(BaseModel):
+    term: int
+    leader_id: str
 
 # -------- UTILS --------
 
@@ -228,26 +300,49 @@ def local_messages():
 def sync():
     return {"messages": messages}
 
+@app.post("/request_vote")
+def request_vote(req: RequestVote):
+    global current_term, voted_for, node_state
+    
+    if req.term > current_term:
+        current_term = req.term
+        node_state = "FOLLOWER"
+        voted_for = None
+        
+    vote_granted = False
+    
+    if req.term >= current_term and (voted_for is None or voted_for == req.candidate_id):
+        voted_for = req.candidate_id
+        vote_granted = True
+        reset_election_timeout()
+        
+    return {"term": current_term, "vote_granted": vote_granted}
+
+@app.post("/append_entries")
+def append_entries(req: AppendEntries):
+    global current_term, node_state, current_leader, voted_for
+    
+    if req.term >= current_term:
+        current_term = req.term
+        node_state = "FOLLOWER"
+        current_leader = req.leader_id
+        reset_election_timeout()
+        return {"term": current_term, "success": True}
+        
+    return {"term": current_term, "success": False}
+
 # -------- SEND --------
 
 @app.post("/send")
 def send(msg: Message):
 
     if current_leader != SELF_URL:
+        if current_leader is None:
+            return {"error": "No leader elected yet. Please retry later."}
         try:
             return requests.post(current_leader + "/send", json=msg.dict(), timeout=3).json()
         except:
-            print(f"[{NODE_ID}] Leader failed → electing")
-
-            elect_new_leader()
-
-            if current_leader != SELF_URL:
-                try:
-                    return requests.post(current_leader + "/send", json=msg.dict(), timeout=10).json()
-                except:
-                    return {"error": "Leader election failed"}
-
-            print(f"[{NODE_ID}] I am new leader → processing locally")
+            return {"error": "Leader unavailable or election in progress. Please retry later."}
 
     global lamport_clock
     lamport_clock += 1
@@ -275,20 +370,12 @@ def send(msg: Message):
 def edit(edit_msg: EditMessage):
 
     if current_leader != SELF_URL:
+        if current_leader is None:
+            return {"error": "No leader elected yet. Please retry later."}
         try:
             return requests.put(current_leader + "/edit", json=edit_msg.dict(), timeout=3).json()
         except:
-            print(f"[{NODE_ID}] Leader failed → electing")
-
-            elect_new_leader()
-
-            if current_leader != SELF_URL:
-                try:
-                    return requests.put(current_leader + "/edit", json=edit_msg.dict(), timeout=10).json()
-                except:
-                    return {"error": "Leader election failed"}
-
-            print(f"[{NODE_ID}] I am new leader → processing locally")
+            return {"error": "Leader unavailable or election in progress. Please retry later."}
 
     global lamport_clock
     lamport_clock += 1
