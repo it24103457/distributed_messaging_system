@@ -40,8 +40,33 @@ QUORUM = (TOTAL_NODES // 2) + 1
 # -------- STORAGE --------
 
 messages = []
-lamport_clock = 0
+vector_clock = {peer: 0 for peer in PEERS}
 WAL_FILE = f"wal_{PORT}.jsonl"
+
+def merge_vector_clocks(vc1, vc2):
+    res = {}
+    for k in set(vc1.keys()).union(vc2.keys()):
+        res[k] = max(vc1.get(k, 0), vc2.get(k, 0))
+    return res
+
+def is_newer(clock1, clock2, timestamp1, timestamp2):
+    v1_greater_or_equal = True
+    v2_greater_or_equal = True
+    keys = set(clock1.keys()).union(clock2.keys())
+    for k in keys:
+        v1_val = clock1.get(k, 0)
+        v2_val = clock2.get(k, 0)
+        if v1_val < v2_val:
+            v1_greater_or_equal = False
+        if v2_val < v1_val:
+            v2_greater_or_equal = False
+            
+    if v1_greater_or_equal and not v2_greater_or_equal:
+        return True
+    if v2_greater_or_equal and not v1_greater_or_equal:
+        return False
+        
+    return timestamp1 > timestamp2
 
 def append_to_wal(message):
     with open(WAL_FILE, "a") as f:
@@ -53,7 +78,7 @@ if os.path.exists(WAL_FILE):
             if line.strip():
                 msg = json.loads(line)
                 messages.append(msg)
-                lamport_clock = max(lamport_clock, msg.get("clock", 0))
+                vector_clock = merge_vector_clocks(vector_clock, msg.get("clock", {}))
 
 # -------- STATE --------
 
@@ -80,13 +105,13 @@ def election_timer_task():
     timeout = get_election_timeout()
     
     while True:
-        time.sleep(0.5)
+        time.sleep(0.1)
         
         if node_state == "LEADER":
             continue
             
         if time.time() - last_heartbeat > timeout:
-            print(f"[{NODE_ID}] Election timeout! Starting election for term {current_term + 1}")
+            print(f"[{NODE_ID}] Election timeout! Starting election for term {current_term + 1}", flush=True)
             node_state = "CANDIDATE"
             current_term += 1
             voted_for = SELF_URL
@@ -105,17 +130,23 @@ def election_timer_task():
                     if res.status_code == 200:
                         data = res.json()
                         if data.get("term", 0) > current_term:
+                            print(f"[{NODE_ID}] Stepping down. {peer} has term {data.get('term')} > my {current_term}", flush=True)
                             current_term = data.get("term")
                             node_state = "FOLLOWER"
                             voted_for = None
+                            reset_election_timeout()
                             break
                         if data.get("vote_granted"):
+                            print(f"[{NODE_ID}] Got vote from {peer}", flush=True)
                             votes_received += 1
-                except:
-                    pass
+                        else:
+                            print(f"[{NODE_ID}] Vote rejected by {peer}. Data: {data}", flush=True)
+                except Exception as e:
+                    print(f"[{NODE_ID}] Error requesting vote from {peer}: {type(e).__name__}", flush=True)
             
+            print(f"[{NODE_ID}] Election for term {current_term} ended. Votes: {votes_received}/{QUORUM}, state={node_state}", flush=True)
             if node_state == "CANDIDATE" and votes_received >= QUORUM:
-                print(f"[{NODE_ID}] Won election! I am the new leader for term {current_term}")
+                print(f"[{NODE_ID}] Won election! I am the new leader for term {current_term}", flush=True)
                 node_state = "LEADER"
                 current_leader = SELF_URL
                 
@@ -163,17 +194,17 @@ def heartbeat_task():
 # -------- RECOVERY --------
 
 def merge_messages(incoming_msgs):
-    global messages, lamport_clock
+    global messages, vector_clock
 
     local_map = {m["id"]: m for m in messages}
 
     for m in incoming_msgs:
         existing = local_map.get(m["id"])
 
-        if not existing or m["clock"] > existing["clock"]:
+        if not existing or is_newer(m.get("clock", {}), existing.get("clock", {}), m.get("timestamp", ""), existing.get("timestamp", "")):
             local_map[m["id"]] = m
 
-        lamport_clock = max(lamport_clock, m.get("clock", 0))
+        vector_clock = merge_vector_clocks(vector_clock, m.get("clock", {}))
 
     messages = list(local_map.values())
 
@@ -204,12 +235,13 @@ def periodic_sync():
 
 @app.on_event("startup")
 def startup():
+    def delayed_recovery():
+        time.sleep(2)
+        recover_node()
+
     threading.Thread(target=heartbeat_task, daemon=True).start()
     threading.Thread(target=election_timer_task, daemon=True).start()
-
-    time.sleep(2)
-    recover_node()
-
+    threading.Thread(target=delayed_recovery, daemon=True).start()
     threading.Thread(target=periodic_sync, daemon=True).start()
 
 # -------- MODELS --------
@@ -271,7 +303,7 @@ def quorum_read():
     for node_msgs in responses:
         for m in node_msgs:
             existing = merged.get(m["id"])
-            if not existing or m["clock"] > existing["clock"]:
+            if not existing or is_newer(m.get("clock", {}), existing.get("clock", {}), m.get("timestamp", ""), existing.get("timestamp", "")):
                 merged[m["id"]] = m
 
     return list(merged.values())
@@ -340,12 +372,13 @@ def send(msg: Message):
         if current_leader is None:
             return {"error": "No leader elected yet. Please retry later."}
         try:
-            return requests.post(current_leader + "/send", json=msg.dict(), timeout=3).json()
-        except:
+            return requests.post(current_leader + "/send", json=msg.dict(), timeout=10).json()
+        except Exception as e:
+            print(f"[{NODE_ID}] Error forwarding to leader: {e}")
             return {"error": "Leader unavailable or election in progress. Please retry later."}
 
-    global lamport_clock
-    lamport_clock += 1
+    global vector_clock
+    vector_clock[SELF_URL] = vector_clock.get(SELF_URL, 0) + 1
 
     message = {
         "id": str(uuid.uuid4()),
@@ -353,7 +386,7 @@ def send(msg: Message):
         "receiver": msg.receiver,
         "content": msg.content,
         "timestamp": datetime.datetime.now().astimezone().isoformat(),
-        "clock": lamport_clock
+        "clock": vector_clock.copy()
     }
 
     if not quorum_write(message):
@@ -373,19 +406,20 @@ def edit(edit_msg: EditMessage):
         if current_leader is None:
             return {"error": "No leader elected yet. Please retry later."}
         try:
-            return requests.put(current_leader + "/edit", json=edit_msg.dict(), timeout=3).json()
-        except:
+            return requests.put(current_leader + "/edit", json=edit_msg.dict(), timeout=10).json()
+        except Exception as e:
+            print(f"[{NODE_ID}] Error forwarding edit to leader: {e}")
             return {"error": "Leader unavailable or election in progress. Please retry later."}
 
-    global lamport_clock
-    lamport_clock += 1
+    global vector_clock
+    vector_clock[SELF_URL] = vector_clock.get(SELF_URL, 0) + 1
 
     for i, m in enumerate(messages):
         if m["id"] == edit_msg.id:
 
             updated = m.copy()
             updated["content"] = edit_msg.content
-            updated["clock"] = lamport_clock
+            updated["clock"] = vector_clock.copy()
             updated["timestamp"] = datetime.datetime.now().astimezone().isoformat()
 
             if not quorum_write(updated):
@@ -402,13 +436,13 @@ def edit(edit_msg: EditMessage):
 
 @app.post("/replicate")
 def replicate(message: dict):
-    global lamport_clock
+    global vector_clock
 
-    lamport_clock = max(lamport_clock, message.get("clock", 0)) + 1
+    vector_clock = merge_vector_clocks(vector_clock, message.get("clock", {}))
 
     for i, m in enumerate(messages):
         if m["id"] == message["id"]:
-            if message["clock"] > m["clock"]:
+            if is_newer(message.get("clock", {}), m.get("clock", {}), message.get("timestamp", ""), m.get("timestamp", "")):
                 messages[i] = message
                 append_to_wal(message)
             return {"status": "updated"}
@@ -428,6 +462,6 @@ def get_messages():
     if result is None:
         return {"error": "Quorum read failed"}
 
-    sorted_msgs = sorted(result, key=lambda m: (m["clock"], m["id"]))
+    sorted_msgs = sorted(result, key=lambda m: (sum(m.get("clock", {}).values()), m["id"]))
 
     return {"messages": sorted_msgs}
