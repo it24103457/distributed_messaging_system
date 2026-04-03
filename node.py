@@ -91,16 +91,34 @@ def append_entries(req: AppendEntries):
 
 @app.post("/send")
 def send(msg: Message):
-    if state.current_leader != config.SELF_URL:
-        if state.current_leader is None:
-            return {"error": "No leader elected yet. Please retry later."}
-        try:
-            return requests.post(state.current_leader + "/send", json=msg.dict(), timeout=10).json()
-        except Exception as e:
-            print(f"[{config.NODE_ID}] Error forwarding to leader: {e}")
-            return {"error": "Leader unavailable or election in progress. Please retry later."}
+    MAX_RETRIES = 3
+    RETRY_DELAY = 2
 
-    state.vector_clock[config.SELF_URL] = state.vector_clock.get(config.SELF_URL, 0) + 1
+    for attempt in range(MAX_RETRIES):
+        if state.current_leader != config.SELF_URL:
+            if state.current_leader is None:
+                if attempt < MAX_RETRIES - 1:
+                    import time
+                    time.sleep(RETRY_DELAY)
+                    continue
+                else:
+                    return {"error": "No leader elected yet. Automatic retry failed."}
+            try:
+                return requests.post(state.current_leader + "/send", json=msg.dict(), timeout=10).json()
+            except Exception as e:
+                print(f"[{config.NODE_ID}] Error forwarding to leader (attempt {attempt+1}): {e}")
+                if attempt < MAX_RETRIES - 1:
+                    import time
+                    time.sleep(RETRY_DELAY)
+                    continue
+                else:
+                    return {"error": "Leader unavailable or election in progress. Automatic retry failed."}
+        else:
+            break
+
+    with state.vector_clock_lock:
+        state.vector_clock[config.SELF_URL] = state.vector_clock.get(config.SELF_URL, 0) + 1
+        current_clock = state.vector_clock.copy()
 
     message = {
         "id": str(uuid.uuid4()),
@@ -108,14 +126,13 @@ def send(msg: Message):
         "receiver": msg.receiver,
         "content": msg.content,
         "timestamp": datetime.datetime.now().astimezone().isoformat(),
-        "clock": state.vector_clock.copy()
+        "clock": current_clock
     }
 
     if not utils.quorum_write(message):
         return {"error": "Quorum not achieved"}
 
-    storage.append_to_wal(message)
-    state.messages.append(message)
+    storage.append_message(message)
 
     return {"stored_at": config.NODE_ID, "message": message}
 
@@ -123,51 +140,60 @@ def send(msg: Message):
 
 @app.put("/edit")
 def edit(edit_msg: EditMessage):
-    if state.current_leader != config.SELF_URL:
-        if state.current_leader is None:
-            return {"error": "No leader elected yet. Please retry later."}
-        try:
-            return requests.put(state.current_leader + "/edit", json=edit_msg.dict(), timeout=10).json()
-        except Exception as e:
-            print(f"[{config.NODE_ID}] Error forwarding edit to leader: {e}")
-            return {"error": "Leader unavailable or election in progress. Please retry later."}
+    MAX_RETRIES = 3
+    RETRY_DELAY = 2
 
-    state.vector_clock[config.SELF_URL] = state.vector_clock.get(config.SELF_URL, 0) + 1
+    for attempt in range(MAX_RETRIES):
+        if state.current_leader != config.SELF_URL:
+            if state.current_leader is None:
+                if attempt < MAX_RETRIES - 1:
+                    import time
+                    time.sleep(RETRY_DELAY)
+                    continue
+                else:
+                    return {"error": "No leader elected yet. Automatic retry failed."}
+            try:
+                return requests.put(state.current_leader + "/edit", json=edit_msg.dict(), timeout=10).json()
+            except Exception as e:
+                print(f"[{config.NODE_ID}] Error forwarding edit to leader (attempt {attempt+1}): {e}")
+                if attempt < MAX_RETRIES - 1:
+                    import time
+                    time.sleep(RETRY_DELAY)
+                    continue
+                else:
+                    return {"error": "Leader unavailable or election in progress. Automatic retry failed."}
+        else:
+            break
 
-    for i, m in enumerate(state.messages):
-        if m["id"] == edit_msg.id:
-            updated = m.copy()
-            updated["content"] = edit_msg.content
-            updated["clock"] = state.vector_clock.copy()
-            updated["timestamp"] = datetime.datetime.now().astimezone().isoformat()
+    with state.vector_clock_lock:
+        state.vector_clock[config.SELF_URL] = state.vector_clock.get(config.SELF_URL, 0) + 1
+        current_clock = state.vector_clock.copy()
 
-            if not utils.quorum_write(updated):
-                return {"error": "Quorum not achieved"}
+    m = storage.get_message_by_id(edit_msg.id)
+    if not m:
+        return {"error": "Message not found"}
 
-            state.messages[i] = updated
-            storage.append_to_wal(updated)
+    m["content"] = edit_msg.content
+    m["clock"] = current_clock
+    m["timestamp"] = datetime.datetime.now().astimezone().isoformat()
 
-            return {"edited_at": config.NODE_ID, "message": updated}
+    if not utils.quorum_write(m):
+        return {"error": "Quorum not achieved"}
 
-    return {"error": "Message not found"}
+    storage.append_message(m)
+
+    return {"edited_at": config.NODE_ID, "message": m}
 
 # -------- REPLICATION --------
 
 @app.post("/replicate")
 def replicate(message: dict):
-    state.vector_clock = storage.merge_vector_clocks(state.vector_clock, message.get("clock", {}))
+    with state.vector_clock_lock:
+        state.vector_clock = storage.merge_vector_clocks(state.vector_clock, message.get("clock", {}))
 
-    for i, m in enumerate(state.messages):
-        if m["id"] == message["id"]:
-            if storage.is_newer(message.get("clock", {}), m.get("clock", {}), message.get("timestamp", ""), m.get("timestamp", "")):
-                state.messages[i] = message
-                storage.append_to_wal(message)
-            return {"status": "updated"}
+    storage.append_message(message)
 
-    state.messages.append(message)
-    storage.append_to_wal(message)
-
-    return {"status": "added"}
+    return {"status": "processed"}
 
 # -------- READ --------
 
