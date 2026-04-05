@@ -8,7 +8,7 @@ def reset_election_timeout():
     state.last_heartbeat = time.time()
 
 def get_election_timeout():
-    return random.uniform(3.0, 6.0)
+    return random.uniform(1.0, 2.0)
 
 def send_heartbeats():
     alive = []
@@ -20,7 +20,7 @@ def send_heartbeats():
             res = requests.post(peer + "/append_entries", json={
                 "term": state.current_term,
                 "leader_id": config.SELF_URL
-            }, timeout=1)
+            }, timeout=0.2)
             if res.status_code == 200:
                 data = res.json()
                 if data.get("term", 0) > state.current_term:
@@ -60,7 +60,7 @@ def election_timer_task():
                     res = requests.post(peer + "/request_vote", json={
                         "term": state.current_term,
                         "candidate_id": config.SELF_URL
-                    }, timeout=1)
+                    }, timeout=0.2)
                     if res.status_code == 200:
                         data = res.json()
                         if data.get("term", 0) > state.current_term:
@@ -94,4 +94,4 @@ def heartbeat_task():
             state.active_peers.clear()
             state.active_peers.update(alive)
             
-        time.sleep(1)
+        time.sleep(0.3)
