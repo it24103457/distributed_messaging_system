@@ -1,5 +1,6 @@
 import requests
 import time
+import concurrent.futures
 import config
 import state
 import storage
@@ -7,32 +8,46 @@ import storage
 def quorum_write(message):
     success = 1
 
-    for peer in config.PEERS:
-        if peer == config.SELF_URL:
-            continue
-
+    def send_replica(peer):
         try:
             res = requests.post(peer + "/replicate", json=message, timeout=1)
-            if res.status_code == 200:
-                success += 1
+            return res.status_code == 200
         except:
-            pass
+            return False
+
+    peers_to_sync = [p for p in config.PEERS if p != config.SELF_URL]
+    
+    if not peers_to_sync:
+        return True
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(peers_to_sync))) as executor:
+        results = executor.map(send_replica, peers_to_sync)
+        success += sum(1 for r in results if r)
 
     return success >= config.QUORUM
 
 def quorum_read():
     responses = [state.messages]
 
-    for peer in config.PEERS:
-        if peer == config.SELF_URL:
-            continue
-
+    def fetch_msgs(peer):
         try:
             res = requests.get(peer + "/messages_local", timeout=1)
             if res.status_code == 200:
-                responses.append(res.json().get("messages", []))
+                return res.json().get("messages", [])
         except:
-            pass
+            return None
+        return None
+
+    peers_to_sync = [p for p in config.PEERS if p != config.SELF_URL]
+    
+    if not peers_to_sync:
+        return responses
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(peers_to_sync))) as executor:
+        results = executor.map(fetch_msgs, peers_to_sync)
+        for r in results:
+            if r is not None:
+                responses.append(r)
 
     if len(responses) < config.QUORUM:
         return None
