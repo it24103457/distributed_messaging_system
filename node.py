@@ -176,7 +176,6 @@ def edit(edit_msg: EditMessage):
     m["content"] = edit_msg.content
     m["clock"] = current_clock
     m["timestamp"] = datetime.datetime.now().astimezone().isoformat()
-    m["edited"] = True
 
     if not utils.quorum_write(m):
         return {"error": "Quorum not achieved"}
